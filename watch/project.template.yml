@@ -1,0 +1,77 @@
+name: WristDeck
+options:
+  bundleIdPrefix: com.donalleniii
+  deploymentTarget:
+    watchOS: "10.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "4"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: __DEVELOPMENT_TEAM__
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  WristDeck:
+    type: application
+    platform: watchOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+    scheme: {}
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: WristDeck
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        WKApplication: true
+        WKWatchOnly: true
+        NSLocalNetworkUsageDescription: WristDeck talks to the bridge server on your Mac over your local network.
+        NSBonjourServices:
+          - _wristdeck._tcp
+        # Lets the app wake periodically to check for pending approvals and
+        # raise a local notification even when it is not on screen.
+        WKBackgroundModes:
+          - remote-notification
+        NSAppTransportSecurity:
+          # Covers 192.168/10/172.16 and *.local. Does NOT cover Tailscale's
+          # 100.64.0.0/10 CGNAT range, which watchOS refuses over cleartext
+          # with NSURLErrorAppTransportSecurityRequiresSecureConnection (-1022).
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            # This Mac's tailnet IP, filled in by setup.sh. watchOS refuses
+            # cleartext to 100.64.0.0/10 without an explicit exception.
+            "__TAILSCALE_IP__":
+              NSExceptionAllowsInsecureHTTPLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.donalleniii.wristdeck
+    dependencies:
+      - target: WristDeckComplication
+
+  # Watch-face complication. Modern watchOS complications are WidgetKit
+  # extensions (ClockKit is deprecated), so this must be its own target
+  # embedded in the app.
+  WristDeckComplication:
+    type: app-extension
+    platform: watchOS
+    sources:
+      - path: Complication
+      - path: Assets.xcassets
+    info:
+      path: Complication/Info.plist
+      properties:
+        CFBundleDisplayName: WristDeck
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.donalleniii.wristdeck.complication
+        ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME: ""
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework

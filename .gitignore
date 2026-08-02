@@ -1,0 +1,24 @@
+# Secrets and machine-specific identity. Never commit these.
+local.env
+bridge/.env
+watch/Sources/Config.plist
+
+# Generated from *.template.yml by setup.sh (contain your team id / tailnet IP)
+watch/project.yml
+mac/project.yml
+
+# Xcode output
+*.xcodeproj
+build/
+DerivedData/
+watch/Sources/Info.plist
+mac/Sources/Info.plist
+watch/Complication/Info.plist
+
+# Dependencies
+bridge/node_modules/
+
+# Personal working notes
+PROGRESS.md
+
+.DS_Store
