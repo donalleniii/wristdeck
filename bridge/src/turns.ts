@@ -52,11 +52,15 @@ export interface Turn {
   createdAt: number;
   /** Where the work happened, so a finished turn can be opened. */
   cwd: string;
+  /** What was asked, truncated; recorded so history rows are recognizable. */
+  prompt: string;
   /** Files the turn edited or opened, newest last. Powers "show me the thing". */
   touched: string[];
   finishedAt?: number;
   outcome?: 'done' | 'error';
   summaryText?: string;
+  numTurns?: number;
+  costUsd?: number;
   abort: AbortController;
   waiters: Waiter[];
   approvals: Map<string, ApprovalRecord>;
@@ -75,7 +79,14 @@ export class TurnStore {
   private turns = new Map<string, Turn>();
   private activeBySession = new Map<string, string>();
 
-  create(agent: Agent, sessionKey: string, cwd = ''): Turn {
+  /**
+   * Fired exactly once per turn, from finish(), after the turn is fully
+   * settled. The server hangs the persistent ledger off this so TurnStore
+   * itself stays free of disk IO.
+   */
+  onFinish?: (turn: Turn) => void;
+
+  create(agent: Agent, sessionKey: string, cwd = '', prompt = ''): Turn {
     const existing = this.activeBySession.get(sessionKey);
     if (existing) throw new BusyError(existing);
     let running = 0;
@@ -90,6 +101,7 @@ export class TurnStore {
       done: false,
       createdAt: Date.now(),
       cwd,
+      prompt: prompt.length > 500 ? `${prompt.slice(0, 497)}...` : prompt,
       touched: [],
       abort: new AbortController(),
       waiters: [],
@@ -297,11 +309,20 @@ export class TurnStore {
       ? (turn.events.find((e) => e.type === 'summary') as { text?: string } | undefined)?.text
         ?? firstLine(terminal.fullText)
       : terminal.message;
+    if (terminal.type === 'done') {
+      turn.numTurns = terminal.numTurns;
+      turn.costUsd = terminal.costUsd;
+    }
     clearTimeout(turn.zombieTimer);
     if (this.activeBySession.get(turn.sessionKey) === turn.id) {
       this.activeBySession.delete(turn.sessionKey);
     }
     this.flush(turn);
+    try {
+      this.onFinish?.(turn);
+    } catch (err) {
+      console.warn('[turns] onFinish listener failed (non-fatal):', err);
+    }
     this.evict();
   }
 

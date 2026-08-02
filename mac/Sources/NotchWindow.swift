@@ -28,10 +28,14 @@ final class NotchWindow: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    /// Centers horizontally on the active screen, tucked just below the menu bar
-    /// so it sits directly under the notch on notched displays.
+    /// Centers horizontally on the screen the mouse is on (falling back to the
+    /// active one), tucked just below the menu bar so it sits directly under
+    /// the notch on notched displays. Mouse screen, not main: hover-expanding
+    /// from the notch must open the panel where you are pointing.
     func reposition() {
-        guard let screen = NSScreen.main else { return }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main
+        guard let screen else { return }
         let size = contentView?.fittingSize ?? frame.size
         let width = max(size.width, 180)
         let height = max(size.height, 34)

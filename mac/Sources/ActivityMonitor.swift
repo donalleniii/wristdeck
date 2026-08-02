@@ -1,5 +1,22 @@
+import AppKit
 import Foundation
 import Observation
+
+/// An action parked on a human decision, mirrored from the bridge. The watch
+/// answers these too; whoever taps first wins and the other side is told.
+struct PendingApproval: Codable, Identifiable, Equatable {
+    let approvalId: String
+    let tool: String
+    let summary: String
+    let detail: String
+    let cwd: String
+    let risk: String
+    let costHint: String?
+    let createdAt: Double
+    let expiresAt: Double
+
+    var id: String { approvalId }
+}
 
 struct ActivityItem: Codable, Identifiable, Equatable {
     let turnId: String
@@ -7,6 +24,7 @@ struct ActivityItem: Codable, Identifiable, Equatable {
     let status: String
     let startedAt: Double
     let elapsedMs: Double
+    let pending: [PendingApproval]?
 
     var id: String { turnId }
 
@@ -57,12 +75,89 @@ private struct ActivityResponse: Codable {
     let recent: [FinishedItem]?
 }
 
+/// One row of the bridge's persistent ledger (GET /history). Unlike
+/// FinishedItem this survives bridge restarts, so it powers the history menu.
+struct HistoryEntry: Codable, Identifiable, Equatable {
+    let turnId: String
+    let agent: String
+    let prompt: String
+    let summary: String
+    let outcome: String
+    let cwd: String
+    let touched: [String]
+    let createdAt: Double
+    let finishedAt: Double
+    let durationMs: Double
+    let costUsd: Double?
+    let hasShot: Bool?
+
+    var id: String { turnId }
+    var failed: Bool { outcome != "done" }
+    var hasTarget: Bool { !touched.isEmpty || !cwd.isEmpty }
+
+    var agentLabel: String {
+        switch agent {
+        case "claude": return "Claude"
+        case "codex": return "Codex"
+        default: return agent.capitalized
+        }
+    }
+
+    /// The line a menu or panel row leads with: what happened, else what was asked.
+    var headline: String {
+        let text = summary.isEmpty ? prompt : summary
+        return text.isEmpty ? "(no summary)" : text
+    }
+
+    var finishedDate: Date { Date(timeIntervalSince1970: finishedAt / 1000) }
+}
+
+private struct HistoryResponse: Codable {
+    let turns: [HistoryEntry]
+}
+
+/// One file some turn produced, for the panel's Artifacts tab.
+struct Artifact: Identifiable, Equatable {
+    let path: String
+    let agent: String
+    let finishedAt: Double
+
+    var id: String { path }
+    var name: String { (path as NSString).lastPathComponent }
+    var folder: String { ((path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath }
+    var finishedDate: Date { Date(timeIntervalSince1970: finishedAt / 1000) }
+}
+
 /// Polls the bridge for in-flight, watch-triggered work.
 @Observable
 @MainActor
 final class ActivityMonitor {
     private(set) var active: [ActivityItem] = []
     private(set) var bridgeReachable = false
+
+    /// Persistent ledger rows, newest first. Refreshed on launch, after every
+    /// completion, and when the menu is about to show.
+    private(set) var history: [HistoryEntry] = []
+
+    /// True while the mouse is holding the panel open (hover over the notch,
+    /// the pill, or the panel itself). Owned by AppDelegate's hover plumbing.
+    var hoverExpanded = false
+
+    /// Set when the user comes back from being away and turns finished in the
+    /// meantime. Cleared by tapping or dismissing the catch-up pill.
+    struct CatchUp: Equatable {
+        let count: Int
+        let since: Date
+    }
+
+    private(set) var catchUp: CatchUp?
+    /// Idle gap that counts as "away". Long enough that reading a doc does not
+    /// trigger it, short enough that a coffee run does.
+    private let awayThreshold: TimeInterval = 240
+    private var awaySince: Date?
+
+    /// Thumbnails for history rows, keyed by turnId. Small images, tiny cache.
+    private let shotCache = NSCache<NSString, NSImage>()
 
     /// The finished turn currently being announced, if any.
     private(set) var finished: FinishedItem?
@@ -109,6 +204,7 @@ final class ActivityMonitor {
 
     func start() {
         stop()
+        refreshHistory()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.pollOnce()
@@ -116,13 +212,84 @@ final class ActivityMonitor {
             }
         }
         tickTask = Task { [weak self] in
+            var beat = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard let self else { return }
                 if let first = self.active.first {
                     self.elapsed = Date().timeIntervalSince1970 - (first.startedAt / 1000)
                 }
+                beat += 1
+                if beat % 10 == 0 { self.checkAwayReturn() }
             }
+        }
+    }
+
+    /// Away detection by real input idle, NOT display sleep/wake: ProofCapture
+    /// deliberately wakes the display (caffeinate) while you are away, so wake
+    /// events lie. caffeinate asserts activity but synthesizes no HID events,
+    /// so the input-idle clock keeps counting honestly.
+    private static func secondsSinceLastInput() -> TimeInterval {
+        let types: [CGEventType] = [
+            .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+            .keyDown, .scrollWheel, .leftMouseDragged, .rightMouseDragged,
+        ]
+        return types
+            .map { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) }
+            .min() ?? 0
+    }
+
+    private func checkAwayReturn() {
+        let idle = Self.secondsSinceLastInput()
+        if idle >= awayThreshold {
+            // Anchor "away" at the LAST input, not at detection time, so turns
+            // that finished during the first idle minutes still count.
+            if awaySince == nil { awaySince = Date().addingTimeInterval(-idle) }
+            return
+        }
+        guard idle < 3, let since = awaySince else { return }
+        awaySince = nil
+        let missed = history.filter { $0.finishedDate > since }
+        guard !missed.isEmpty else { return }
+        // The catch-up pill becomes the single "you're back" surface: swallow
+        // any in-flight "Done" announcement of those same turns so the user
+        // does not get told twice.
+        acknowledged.formUnion(missed.map(\.turnId))
+        if let current = finished, acknowledged.contains(current.turnId) {
+            finished = nil
+            finishedShownAt = nil
+        }
+        catchUp = CatchUp(count: missed.count, since: since)
+    }
+
+    /// Dismisses the catch-up pill (with or without opening the panel).
+    func acknowledgeCatchUp() {
+        catchUp = nil
+    }
+
+    /// The approval most in need of a human, if any. Sitting at the Mac and
+    /// raising your wrist to tap "Allow" is silly; the pill handles it here.
+    var firstPendingApproval: (turnId: String, approval: PendingApproval)? {
+        for item in active {
+            if let approval = item.pending?.first { return (item.turnId, approval) }
+        }
+        return nil
+    }
+
+    /// Answers a parked approval with the same endpoint the watch uses; the
+    /// bridge's compare-and-set makes a double-tap race harmless.
+    func decide(turnId: String, approvalId: String, allow: Bool) {
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/turns/\(turnId)/approvals/\(approvalId)", relativeTo: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["decision": allow ? "allow" : "deny"])
+        Task {
+            _ = try? await session.data(for: request)
+            // Refresh immediately so the pill clears now, not a poll later.
+            await pollOnce()
         }
     }
 
@@ -181,6 +348,108 @@ final class ActivityMonitor {
         if let baseURL, !token.isEmpty {
             proof.capture(turnId: next.turnId, baseURL: baseURL, token: token)
         }
+        // The ledger just gained a row; keep the menu current.
+        refreshHistory()
+    }
+
+    /// Pulls the persistent ledger. Cheap (a few KB), so it is fine to kick
+    /// this from menuWillOpen as well as after completions.
+    func refreshHistory(limit: Int = 12) {
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/history?limit=\(limit)", relativeTo: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        Task { [weak self] in
+            guard let self else { return }
+            guard let (data, response) = try? await self.session.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let decoded = try? JSONDecoder().decode(HistoryResponse.self, from: data)
+            else { return }
+            if decoded.turns != self.history { self.history = decoded.turns }
+        }
+    }
+
+    /// Opens what a past turn produced (bridge falls back to its ledger for
+    /// turns that are no longer in memory).
+    func openTurn(_ turnId: String) {
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/turns/\(turnId)/open", relativeTo: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        Task { _ = try? await session.data(for: request) }
+    }
+
+    /// Selects the turn's product in Finder. Local, no bridge round trip:
+    /// reveal only selects, it never launches, so openPath's gate is not needed.
+    func reveal(_ entry: HistoryEntry) {
+        revealPath(entry.touched.last ?? entry.cwd)
+    }
+
+    func revealPath(_ path: String) {
+        guard !path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Every file any turn touched, newest turn first, deduped, existing only.
+    /// This IS the artifacts list: the bridge already records touched paths per
+    /// turn, so the gallery falls out of the ledger for free.
+    var artifacts: [Artifact] {
+        var seen = Set<String>()
+        var out: [Artifact] = []
+        for entry in history {
+            for path in entry.touched.reversed() where !seen.contains(path) {
+                seen.insert(path)
+                guard FileManager.default.fileExists(atPath: path) else { continue }
+                out.append(Artifact(path: path, agent: entry.agentLabel, finishedAt: entry.finishedAt))
+            }
+        }
+        return out
+    }
+
+    /// Opens one artifact via the bridge so the executable-extension gate in
+    /// openPath stays the single authority on what "open" is allowed to do.
+    func openArtifact(_ path: String) {
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/open-path", relativeTo: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["path": path])
+        Task { _ = try? await session.data(for: request) }
+    }
+
+    /// Thumbnail for a history row; nil when the bridge has no shot for it.
+    func shotImage(_ turnId: String) async -> NSImage? {
+        if let hit = shotCache.object(forKey: turnId as NSString) { return hit }
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/turns/\(turnId)/shot", relativeTo: baseURL) else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let image = NSImage(data: data) else { return nil }
+        shotCache.setObject(image, forKey: turnId as NSString)
+        return image
+    }
+
+    /// Full-size proof shot in Preview: fetch once, park in temp, open.
+    func openShotInPreview(_ turnId: String) {
+        guard let baseURL, !token.isEmpty,
+              let url = URL(string: "/turns/\(turnId)/shot", relativeTo: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        Task {
+            guard let (data, response) = try? await session.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wristdeck-shot-previews", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let file = dir.appendingPathComponent("\(turnId).png")
+            guard (try? data.write(to: file)) != nil else { return }
+            NSWorkspace.shared.open(file)
+        }
     }
 
     /// Dismisses the current "Done" pill without opening anything.
@@ -192,12 +461,8 @@ final class ActivityMonitor {
 
     /// Opens what the finished turn produced, then dismisses the pill.
     func openFinished() {
-        guard let current = finished, let baseURL, !token.isEmpty else { return }
-        guard let url = URL(string: "/turns/\(current.turnId)/open", relativeTo: baseURL) else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        Task { _ = try? await session.data(for: request) }
+        guard let current = finished else { return }
+        openTurn(current.turnId)
         acknowledgeFinished()
     }
 }

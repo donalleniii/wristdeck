@@ -13,6 +13,7 @@ import { findSession, listAllSessions } from './discovery/index.ts';
 import { summarizeForSpeech } from './summarize.ts';
 import { openPath } from './tools/openPath.ts';
 import { hasShot, pruneShots, saveShot, shotPath } from './screenshot.ts';
+import { appendHistory, compactHistory, findHistoryEntry, readHistory } from './history.ts';
 import { catalog, defaultModel, setDefaultModel } from './models.ts';
 import { advertise } from './bonjour.ts';
 
@@ -21,6 +22,27 @@ app.use(express.json({ limit: '256kb' }));
 app.use(requireAuth);
 
 const store = new TurnStore();
+
+// Every finished turn, success or failure, lands in the persistent ledger, so
+// history survives bridge restarts and the in-memory store's 20-turn eviction.
+// Shot pruning rides along: by count, so thumbnails stay as long as their rows.
+store.onFinish = (turn) => {
+  void appendHistory({
+    turnId: turn.id,
+    agent: turn.agent,
+    prompt: turn.prompt,
+    summary: turn.summaryText ?? '',
+    outcome: turn.outcome ?? 'done',
+    cwd: turn.cwd,
+    touched: [...turn.touched],
+    createdAt: turn.createdAt,
+    finishedAt: turn.finishedAt ?? Date.now(),
+    durationMs: (turn.finishedAt ?? Date.now()) - turn.createdAt,
+    numTurns: turn.numTurns,
+    costUsd: turn.costUsd,
+  });
+  void pruneShots();
+};
 
 /// Runtime-togglable from the watch, so this is changeable without editing .env.
 const settings = { autoOpen: CONFIG.autoOpenOnFinish };
@@ -55,8 +77,7 @@ function runDetached(turn: Turn, baseReq: TurnRequest, summarize: boolean): void
       numTurns: outcome.numTurns,
       costUsd: outcome.costUsd,
     });
-    await autoOpenResult(turn.id);
-    await captureProof(turn.id);
+    if (!outcome.presented) await autoOpenResult(turn.id);
   })().catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[turn ${turn.id}] failed:`, message);
@@ -85,20 +106,6 @@ async function autoOpenResult(turnId: string): Promise<void> {
   }
 }
 
-/**
- * Proof-of-work screenshots are captured by the Mac notch app, NOT here.
- *
- * The bridge runs under launchd, and macOS denies it Screen Recording
- * ("could not create image from display") because that permission is granted
- * per-binary. Granting it would mean handing a bare `node` broad screen access.
- * WristDeckNotch.app is a real bundle in the user's GUI session, so macOS
- * prompts for it normally and the grant is scoped to that app. It watches
- * /activity, captures when a turn finishes, and uploads here.
- */
-async function captureProof(_turnId: string): Promise<void> {
-  await pruneShots(store.recent().map((r) => r.turnId));
-}
-
 function parseAgent(raw: string): Agent | null {
   return raw === 'claude' || raw === 'codex' || raw === 'stub' ? raw : null;
 }
@@ -111,7 +118,7 @@ function startTurn(
   summarize: boolean,
 ): void {
   try {
-    const turn = store.create(agent, sessionKey, req.cwd ?? '');
+    const turn = store.create(agent, sessionKey, req.cwd ?? '', req.text);
     runDetached(turn, req, summarize);
     res.status(202).json({ turnId: turn.id });
   } catch (err) {
@@ -173,7 +180,28 @@ app.get('/activity', async (_req, res) => {
   res.json({ active: store.activity(), recent: withProof });
 });
 
-/// The Mac notch app uploads proof-of-work here (raw PNG body).
+/// The persistent ledger, newest first. Powers the notch app's history menu
+/// and panel; unlike /activity.recent this survives restarts and eviction.
+app.get('/history', async (req, res) => {
+  const raw = Number(req.query.limit ?? 50);
+  const limit = Math.min(200, Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : 50));
+  const entries = await readHistory(limit);
+  const withShots = await Promise.all(
+    entries.map(async (e) => ({ ...e, hasShot: await hasShot(e.turnId) })),
+  );
+  res.json({ turns: withShots });
+});
+
+/**
+ * The Mac notch app uploads proof-of-work here (raw PNG body).
+ *
+ * Capture happens in WristDeckNotch.app, NOT the bridge. The bridge runs under
+ * launchd, and macOS denies it Screen Recording ("could not create image from
+ * display") because that permission is granted per-binary; granting it would
+ * mean handing a bare `node` broad screen access. The notch app is a real
+ * bundle in the user's GUI session, so macOS prompts normally and the grant is
+ * scoped to that app. It watches /activity, captures on finish, uploads here.
+ */
 app.post('/turns/:turnId/shot', express.raw({ type: 'image/png', limit: '4mb' }), async (req, res) => {
   const body = req.body as Buffer | undefined;
   if (!Buffer.isBuffer(body) || body.length < 1024) {
@@ -190,24 +218,44 @@ app.get('/turns/:turnId/shot', async (req, res) => {
     res.status(404).json({ error: 'no_shot' });
     return;
   }
-  res.sendFile(shotPath(req.params.turnId));
+  // dotfiles: shots live under ~/.wristdeck now, and express's default
+  // 'ignore' turns any dot-segment path into a 404.
+  res.sendFile(shotPath(req.params.turnId), { dotfiles: 'allow' });
 });
 
 /// Opens what a finished turn produced, so clicking "Done" on the Mac lands
-/// somewhere useful. Reuses the validated open_path capability.
+/// somewhere useful. Reuses the validated open_path capability. Falls back to
+/// the ledger so history rows stay clickable after restarts and eviction.
 app.post('/turns/:turnId/open', async (req, res) => {
   const turn = store.get(req.params.turnId);
+  let target = turn ? (turn.touched.at(-1) ?? turn.cwd) : '';
   if (!turn) {
-    res.status(404).json({ error: 'unknown_turn' });
-    return;
+    const entry = await findHistoryEntry(req.params.turnId);
+    if (!entry) {
+      res.status(404).json({ error: 'unknown_turn' });
+      return;
+    }
+    target = entry.touched.at(-1) ?? entry.cwd;
   }
-  const target = turn.touched.at(-1) ?? turn.cwd;
   if (!target) {
     res.status(404).json({ error: 'nothing_to_open' });
     return;
   }
   const result = await openPath(target);
   res.status(result.ok ? 200 : 400).json({ target, ...result });
+});
+
+/// Opens one specific artifact (a touched file from history) on the Mac.
+/// Same deny-by-default gate as turn open; the Mac app never opens paths
+/// itself precisely so this validation stays in exactly one place.
+app.post('/open-path', async (req, res) => {
+  const { path } = (req.body ?? {}) as { path?: string };
+  if (typeof path !== 'string' || !path.trim()) {
+    res.status(400).json({ error: 'path_required' });
+    return;
+  }
+  const result = await openPath(path);
+  res.status(result.ok ? 200 : 400).json(result);
 });
 
 app.get('/sessions', async (_req, res) => {
@@ -322,6 +370,9 @@ app.get('/turns/:turnId/events', async (req, res) => {
 const server = app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log(`[wristdeck] bridge listening on http://0.0.0.0:${CONFIG.port}`);
   advertise();
+  // Startup, not per-append: the ledger grows by a few hundred bytes per turn,
+  // so trimming once per bridge lifetime keeps it one-gulp readable.
+  void compactHistory().catch((err) => console.warn('[history] compact failed:', err));
 });
 
 // Without this, a restart orphans any turn parked on an approval and leaves its

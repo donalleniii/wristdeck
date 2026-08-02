@@ -25,6 +25,8 @@ export interface TurnOutcome {
   fullText: string;
   numTurns?: number;
   costUsd?: number;
+  /** The agent already put the result in front of the user on the Mac. */
+  presented?: boolean;
 }
 
 export interface AgentAdapter {

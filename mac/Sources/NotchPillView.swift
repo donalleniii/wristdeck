@@ -143,6 +143,152 @@ struct NotchDonePillView: View {
     }
 }
 
+/// The "agent is waiting on YOU" pill. Amber, with Allow/Deny right on it:
+/// when you are at the Mac, answering should not require raising your wrist.
+struct NotchApprovalPillView: View {
+    let agentLabel: String
+    let approval: PendingApproval
+    let onAllow: () -> Void
+    let onDeny: () -> Void
+
+    private let accent = Color(red: 1.0, green: 0.72, blue: 0.25)
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(accent)
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text("\(agentLabel) needs approval")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(accent)
+                    Image(systemName: "applewatch")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                Text(approval.summary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: 210, alignment: .leading)
+
+            ApprovalActionButton(symbol: "xmark", label: "Deny", tint: Color(red: 1.0, green: 0.35, blue: 0.35), action: onDeny)
+            ApprovalActionButton(symbol: "checkmark", label: "Allow", tint: Color(red: 0.19, green: 0.82, blue: 0.35), action: onAllow)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(.black)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .strokeBorder(accent.opacity(0.45), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.45), radius: 10, y: 3)
+        )
+        .help("\(approval.detail)\n\(approval.cwd)\nrisk: \(approval.risk)")
+    }
+}
+
+struct ApprovalActionButton: View {
+    let symbol: String
+    let label: String
+    let tint: Color
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: symbol)
+                    .font(.system(size: 9, weight: .bold))
+                Text(label)
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .foregroundStyle(hovering ? .black : tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(hovering ? tint : tint.opacity(0.16))
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+}
+
+/// "While you were away" pill: one quiet summary instead of a parade of Done
+/// pills nobody saw. Clicking opens the history panel on exactly that window.
+struct NotchCatchUpPillView: View {
+    let count: Int
+    let onShow: () -> Void
+    let onDismiss: () -> Void
+
+    @State private var hovering = false
+
+    private let accent = Color(red: 0.35, green: 0.62, blue: 1.0)
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(accent)
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text("While you were away")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(accent)
+                    Image(systemName: "applewatch")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                Text(count == 1 ? "1 turn finished" : "\(count) turns finished")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+
+            HStack(spacing: 3) {
+                Image(systemName: "rectangle.expand.vertical")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Show")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .foregroundStyle(hovering ? .white : .white.opacity(0.6))
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .padding(4)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(.black)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .strokeBorder(accent.opacity(hovering ? 0.7 : 0.32), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.45), radius: 10, y: 3)
+        )
+        .scaleEffect(hovering ? 1.02 : 1)
+        .animation(.spring(response: 0.28, dampingFraction: 0.7), value: hovering)
+        .onHover { hovering = $0 }
+        .onTapGesture { onShow() }
+        .help("Show what finished while you were away")
+    }
+}
+
 /// Slow breathing dot: reads as "working" without demanding attention.
 struct PulsingDot: View {
     let color: Color

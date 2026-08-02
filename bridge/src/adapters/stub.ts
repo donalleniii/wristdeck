@@ -1,5 +1,8 @@
 // Test-only adapter: exercises the turn pipeline without spawning a real agent.
-// text commands: "sleep:<ms>" waits before replying; "fail" throws; anything else echoes.
+// text commands: "sleep:<ms>" waits before replying; "fail" throws;
+// "touch:<path>" writes that file and records it as touched (exercises
+// auto-open, proof, history and artifacts); anything else echoes.
+import { writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { AgentAdapter, TurnOutcome, TurnRequest, TurnSink } from './types.ts';
 
@@ -10,6 +13,16 @@ export class StubAdapter implements AgentAdapter {
     const m = req.text.match(/^sleep:(\d+)$/);
     if (m) await delay(Number(m[1]), undefined, { signal });
     if (req.text === 'fail') throw new Error('stub failure requested');
+
+    const touch = req.text.match(/^touch:(.+)$/);
+    if (touch) {
+      const target = touch[1].trim();
+      await writeFile(target, `WristDeck stub artifact, written ${new Date().toISOString()}\n`);
+      req.noteTouched?.(target);
+      const reply = `wrote ${target}`;
+      sink.push({ type: 'text', chunk: reply });
+      return { fullText: reply, numTurns: 1 };
+    }
 
     // Exercises the approval gate end to end without spending anything.
     if (req.text.startsWith('ask')) {

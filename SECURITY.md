@@ -63,9 +63,11 @@ WristDeckNotch; everything else keeps working.
 
 ### The Codex difference
 
-Codex is not gated by the approval prompt. Its sandbox has no network access, so
-it cannot push, deploy, or call an API, but it **can** run shell commands inside
-its working directory. Do not assume the two agents are equally restricted.
+Codex can run shell commands inside its working directory. It starts without
+network or out-of-project write access; app-server routes requests for those
+extra permissions to the Watch. Approval is turn-scoped and grants only the
+permission Codex requested. A leaked WristDeck token could approve such a
+request, which is another reason not to enable Funnel casually.
 
 ## Reporting a vulnerability
 

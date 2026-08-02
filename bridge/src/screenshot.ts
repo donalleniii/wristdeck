@@ -8,13 +8,18 @@
 // back either empty or as a desktop-picture-only image; captureScreen() reports
 // which so the caller can degrade instead of shipping a black rectangle.
 import { execFile } from 'node:child_process';
-import { mkdir, rm, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { DATA_DIR } from './history.ts';
 
 const execFileAsync = promisify(execFile);
-const SHOT_DIR = join(tmpdir(), 'wristdeck-shots');
+// Alongside the history ledger, NOT tmpdir: proof shots are part of the
+// history record now, and tmpdir gets swept by the OS.
+const SHOT_DIR = join(DATA_DIR, 'shots');
+
+/** Shots kept on disk. History rows older than this simply have no thumbnail. */
+const MAX_SHOTS = 200;
 
 /** Watch screens are small; a wide capture only needs to survive downscaling. */
 const TARGET_WIDTH = 420;
@@ -68,13 +73,25 @@ export async function hasShot(turnId: string): Promise<boolean> {
   }
 }
 
-/** Keeps the shot directory from growing without bound. */
-export async function pruneShots(keepTurnIds: string[]): Promise<void> {
+/**
+ * Keeps the shot directory from growing without bound, by COUNT, not by which
+ * turns are still in memory. The old id-based prune deleted every screenshot
+ * within ~10 minutes of its turn finishing, which is why there was no history.
+ */
+export async function pruneShots(max = MAX_SHOTS): Promise<void> {
   try {
-    const { readdir } = await import('node:fs/promises');
-    const keep = new Set(keepTurnIds.map((id) => `${id}.png`));
-    for (const name of await readdir(SHOT_DIR)) {
-      if (!keep.has(name)) await rm(join(SHOT_DIR, name), { force: true });
+    const names = (await readdir(SHOT_DIR)).filter((n) => n.endsWith('.png'));
+    if (names.length <= max) return;
+    const dated = await Promise.all(
+      names.map(async (name) => {
+        const path = join(SHOT_DIR, name);
+        const info = await stat(path).catch(() => null);
+        return { path, mtime: info?.mtimeMs ?? 0 };
+      }),
+    );
+    dated.sort((a, b) => a.mtime - b.mtime);
+    for (const { path } of dated.slice(0, dated.length - max)) {
+      await rm(path, { force: true });
     }
   } catch {
     // directory may not exist yet

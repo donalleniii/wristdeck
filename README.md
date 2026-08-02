@@ -27,7 +27,7 @@ Nobody operating this project can see your prompts, your code, or your usage.
 ```
 Apple Watch  ──HTTPS + bearer token──▶  Bridge (Node, your Mac)
    SwiftUI                                 ├─ Claude adapter  (Agent SDK)
-   voice in / TTS out                      ├─ Codex adapter   (Codex SDK)
+   voice in / TTS out                      ├─ Codex adapter   (app-server)
                                            ├─ approval gate   (PreToolUse hook)
                                            └─ wristdeck-tools (MCP)
 
@@ -51,7 +51,13 @@ on watchOS.
 - **Results come to you.** The file the agent wrote opens on your Mac, and a
   screenshot of the result appears on your watch.
 - **Mac indicator.** A pill under the notch while work runs; click "Done" to open
-  what it produced.
+  what it produced. When an agent is parked on an approval, the pill turns amber
+  with Allow and Deny right on it.
+- **History that survives.** Every turn lands in a persistent ledger
+  (`~/.wristdeck/`), with its prompt, summary, touched files and proof
+  screenshot. Hover the notch for a drop-down panel of past turns and produced
+  files, or use the menu bar icon. Come back after being away and one pill
+  summarizes what finished while you were gone.
 
 ## Requirements
 
@@ -115,9 +121,10 @@ settings-file allow rules are applied *before* a permission callback runs, so a
 rule in your own `settings.json` could otherwise bypass the policy entirely.
 See `bridge/src/hook.ts`.
 
-Codex is governed differently. Its sandbox has **no network access**, so it
-physically cannot push or deploy; containment is its gate. The Codex SDK exposes
-no approval callback, so it cannot be wired into the same prompt today.
+Codex starts in a `workspace-write` sandbox. When it needs network access or a
+write outside the selected project, app-server parks that exact request on the
+same Watch approval card. An approval grants only the requested permission for
+that turn; it does not switch Codex into unrestricted mode.
 
 ## Layout
 
@@ -143,6 +150,9 @@ node test/policy-test.mjs               # classifier, no bridge needed
 node test/approval-test.mjs             # approval semantics
 node test/permission-execution-test.mjs # permitted actions actually execute
 node test/settings-bypass-test.mjs      # settings rules cannot bypass policy
+node test/codex-appserver-test.mjs      # Codex resume, approval, abort, files
+node test/history-test.mjs write        # persistent ledger (then restart the
+node test/history-test.mjs verify       # bridge and run the verify phase)
 ```
 
 `permission-execution-test.mjs` exists because of a real bug: the hook returned
